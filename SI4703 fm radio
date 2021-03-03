@@ -1,0 +1,525 @@
+/*  SI4703 fm radio with encoder switch 
+ *   Oled I2C 128x64
+ *   RDS RSSI 
+ *   2017 11 25 
+ *   https://www.instructables.com/id/Si4703-FM-Radio-Arduino-Uno-Schield/
+ */
+
+#include <Si4703_Breakout.h> //https://cdn.instructables.com/ORIG/FDV/JYVX/J34PIB88/FDVJYVXJ34PIB88.rar
+#include <Wire.h>
+#include <EEPROM.h>
+#include "U8glib.h"  //https://github.com/olikraus/U8glib_Arduino
+
+#define DEBUG 0  // change from 0 to 1 if you want debug (serial monitor)
+ 
+U8GLIB_SSD1306_128X64 u8g(U8G_I2C_OPT_NONE | U8G_I2C_OPT_DEV_0);
+#define SI4703Address 0x10      // Si4703 I2C Address.
+
+/*SI4703 - Pins*/
+int resetPin = 6;
+int SDIO = A4;
+int SCLK = A5;
+int RDSInterruptPin = 7; // GPIO2 for RDS Interrupt
+unsigned int rdscount = 0;
+
+
+/*EEPROM*/
+int ChannelEEP=0x01;
+int VolumeEEP=0x02;
+
+/*GPO-ATMega*/
+int StereoLED = 0x0D;
+int AF_LED    = 0x05;
+int RTReady =false;
+int RDSReady=false;
+int PSReady =false;
+
+
+int channel_ant = 875;
+
+
+// Setting up the channel
+int lowest = 874;
+int highest = 1081;
+int changeamnt = 1;
+
+// Setting up the volume
+int low = 0;
+int high = 30;
+int changevol = 1;
+
+
+// Timing for polling the encoder
+unsigned long currentTime;
+unsigned long lastTime;
+
+
+// Pin definitions
+const int pinA = 2;
+const int pinB = 3;
+const int pinC = 4;
+const int pinD = 5;
+
+
+// Storing the readings
+boolean encA;
+boolean encB;
+boolean lastA = false;
+boolean encC;
+boolean encD;
+boolean lastD = false;
+
+/*Init SI4703 Driver*/
+Si4703_Breakout radio(resetPin, SDIO, SCLK, RDSInterruptPin);
+
+/*for SI4703*/
+int channel;
+int volume;
+
+/*SI4703 RDS*/
+char RT[65];
+char PS[9];
+char PTY[12];
+char CLOCK[2];
+char DATE[4];
+int  AF[41];
+char PICODE[2];
+unsigned int PI_;
+
+char TC[2];
+int TC_;
+
+const int VOID = 0;
+const int EON  = 1;
+const int TP   = 2;
+const int TA   = 3;
+
+
+
+void draw(void)
+{
+  int rssi=radio.getRSSI();
+  u8g.setFont(u8g_font_profont15r);
+  u8g.drawStr(0, 12, "FM Radio");
+
+  u8g.setPrintPos(60, 12);
+  u8g.println(channel/10.);
+  u8g.println("MHz");
+
+  u8g.setPrintPos(0, 60);
+  u8g.println("RSSI ");
+  u8g.println(rssi );
+  u8g.println("dBm");
+
+  u8g.setPrintPos(80, 60);
+  u8g.println("VOL ");
+  u8g.println(volume);
+  
+  u8g.drawRFrame(0, 15, 128, 25, 10);
+  
+  u8g.setPrintPos(40, 33);
+  u8g.println(PS);
+
+}
+
+void setup()
+{
+  // Init Pins
+  //Output
+  pinMode(pinA, INPUT_PULLUP);
+  pinMode(pinB, INPUT_PULLUP);
+  pinMode(pinC, INPUT_PULLUP);
+  pinMode(pinD, INPUT_PULLUP);
+  
+  
+   currentTime = millis();
+   lastTime = currentTime; 
+   pinMode(StereoLED, OUTPUT);
+   digitalWrite(StereoLED, LOW);
+
+  //Serial write Commands
+  if(DEBUG){
+  Serial.begin(9600);
+  Serial.println("\n\nSi4703_Breakout Test Sketch");
+  Serial.println("===========================");  
+  Serial.println("a       Start AF seek");
+  Serial.println("+ -     Volume (max 15)");
+  Serial.println("u d     Auto seek up / down");
+  Serial.println("w s     Manual seek up / down");
+  Serial.println("r       Show RDS Data");
+  Serial.println("Send me a command letter.");}
+
+  //Read last channel and volume
+  GetDataFromEEP();
+
+  //Initialize and Power up the SI4703
+  radio.powerOn();
+  radio.setVolume(volume);
+  radio.setChannel(channel);
+
+  //Print Informations to Serial Monitor
+  displayInfo();
+}
+
+void loop()
+{  
+if (rdscount >= 10){
+  
+  RDSReady=radio.getRDS();
+  if(RDSReady==true)
+  {
+    if(PSReady==false)
+    {
+      delay (50);
+      char PS_[9];
+      PSReady=radio.getPS(PS_);
+      if(strlen(PS_)==8)strncpy(PS,PS_,8);
+      Serial.println(PS);
+      OledDisplayInfo();
+      SI4703_clearRDS();
+      rdscount = 0;  
+    }
+    OledDisplayInfo();
+    
+    }
+}
+rdscount++;
+
+
+ if (channel_ant != channel)
+ {
+      //SI4703_clearRDS();
+      if(channel<875)channel=1080;
+      if(channel>1080)channel=875;
+      radio.setChannel(channel);
+      SetDataToEEP();
+      displayInfo();
+      OledDisplayInfo();
+      channel_ant = channel;
+ }
+
+ if (digitalRead(3) == CHANGE) 
+ {
+
+  // Read elapsed time
+  currentTime = millis();
+  // Check if it's time to read
+  if(currentTime >= (lastTime ))
+  {
+    // read the two pins
+    encC = digitalRead(pinC);
+    encD = digitalRead(pinD);
+    // check if C has gone from high to low
+    if ((!encC) && (lastD))
+    {
+      // check if D is high
+      if (encD)
+      {
+        // clockwise
+        if (volume + changevol <= high)
+        {
+          volume = volume + changevol; 
+        }
+      }
+      else
+      {
+        // anti-clockwise
+        if (volume - changevol >= low)
+        {
+          volume = volume - changevol; 
+        }
+      }
+      radio.setVolume(volume);
+      OledDisplayInfo();
+      displayInfo();
+     
+     
+    }
+    // store channel of A and millis for next loop
+    lastD = encC;
+    lastTime = currentTime;
+  }
+ }
+  if (digitalRead(0) == CHANGE) 
+{
+ // Read elapsed time
+  currentTime = millis();
+  // Check if it's time to read
+  if(currentTime >= (lastTime ))
+  {
+    // read the two pins
+    encA = digitalRead(pinA);
+    encB = digitalRead(pinB);
+    // check if A has gone from high to low
+    if ((!encA) && (lastA))
+    {
+      // check if B is high
+      if (encB)
+      {
+        // clockwise
+        if (channel + changeamnt <= highest)
+        {
+          channel = channel + changeamnt;         
+        }
+      }
+      else
+      {
+        // anti-clockwise
+        if (channel - changeamnt >= lowest)
+        {
+          channel = channel - changeamnt; 
+        }
+      }
+     SI4703_clearRDS();
+    }
+    // store channel of A and millis for next loop
+    lastA = encA;
+    lastTime = currentTime;
+  }
+}
+ SI4703_readRDS();
+
+  //Serial Monitor input control
+  if (Serial.available())
+  {
+    char ch = Serial.read();
+    
+    if (ch == 'u') 
+    {
+      Serial.println("\nAuto Search Up");
+      SI4703_seekUpAuto();
+    } 
+    else if (ch == 'd') 
+    {
+      Serial.println("\nAuto Search Down");
+      SI4703_seekDnAuto();
+    } 
+    else if (ch == '+') 
+    {
+      volume ++;
+      if (volume == 31) volume = 30;
+      radio.setVolume(volume);
+      SetDataToEEP();
+      displayInfo();
+    } 
+    else if (ch == '-') 
+    {
+      volume --;
+      if (volume < 0) volume = 0;
+      radio.setVolume(volume);
+      SetDataToEEP();
+      displayInfo();
+    } 
+    else if (ch == 'a')
+    {
+      SI4703_seekAF();
+    }
+    else if (ch == 'r')
+    {
+      displayRDS();
+    }
+    else if(ch == 'w')
+    {
+     channel++;
+     SI4703_clearRDS();
+     if(channel>1080)channel=875;
+     displayInfo();
+     SetDataToEEP();
+     radio.setChannel(channel);
+    }
+    else if(ch == 's')
+    {
+     channel--;
+     SI4703_clearRDS();
+     if(channel<875)channel=1080;
+     displayInfo();
+     SetDataToEEP();
+     radio.setChannel(channel);
+    }
+  }
+}
+
+void SI4703_seekUpAuto (void)
+{
+      //channel = radio.seekUp();
+      SI4703_clearRDS();
+      channel+=1;
+      radio.setVolume(0);
+      radio.setChannel(channel);
+      delay(100);
+      for(int seekup=channel;; seekup++)
+      {
+         if(seekup>1080)seekup=875;
+         Serial.print(seekup/10.);Serial.println(" MHz");
+         radio.setChannel(seekup);
+         delay(30);
+         int SI4703AFC_Tune=radio.getTune();
+         int SI4703RSSI_Tune=radio.getRSSI();
+         delay((SI4703RSSI_Tune*4));
+         if(((SI4703AFC_Tune==false)&&(SI4703RSSI_Tune>20)))
+         {
+            radio.setVolume(volume);
+            channel=seekup;
+            SetDataToEEP();
+            displayInfo();
+            break;
+         }
+      }
+      SI4703_clearRDS();
+}
+
+void SI4703_seekDnAuto (void)
+{
+      //channel = radio.seekDown();
+      SI4703_clearRDS();
+      channel-=1;
+      radio.setVolume(0);
+      radio.setChannel(channel);
+      delay(100);
+      for(int seekdown=channel;; seekdown--)
+      {         
+         if(seekdown<=875)seekdown=1080;
+         Serial.print(seekdown/10.);Serial.println(" MHz");
+         radio.setChannel(seekdown);
+         delay(30);
+         int SI4703AFC_Tune=radio.getTune();
+         int SI4703RSSI_Tune=radio.getRSSI();
+         delay((SI4703RSSI_Tune*4));
+         if(((SI4703AFC_Tune==false)&&(SI4703RSSI_Tune>20)))
+         {
+            radio.setVolume(volume);
+            channel=seekdown;
+            SetDataToEEP();
+            displayInfo();
+            break;
+         }
+      }
+      SI4703_clearRDS();
+}
+void SI4703_seekAF (void)
+{
+  int newChannel[1];
+  Serial.println("AF seek starts now...!");
+  while(!(radio.TuneAF(AF,PICODE,channel,volume)));
+  if(newChannel)channel=newChannel[0];
+  SetDataToEEP();
+  displayInfo();
+}
+void displayInfo (void)
+{
+   int rssi=radio.getRSSI();
+   int tune=radio.getTune();
+   int stereo=radio.getStereo();
+   if ( DEBUG){
+   Serial.print("\n\nChannel: "); Serial.print(channel/10.);Serial.println(" MHz");
+   Serial.print("Volume: "); Serial.println(volume);
+   Serial.print("RSSI: ");Serial.print(rssi);Serial.println("dBuV");
+   Serial.print("Tune: ");
+   if(tune==0)Serial.println("AFC Tuned!!");
+   if(tune==1)Serial.println("AFC Tuning...");
+   Serial.print("Sound: ");
+   if(stereo==1){Serial.println("Stereo");digitalWrite(StereoLED, HIGH);}
+   if(stereo==0){Serial.println("Mono");digitalWrite(StereoLED, LOW);}
+   }
+}
+void displayRDS (void)
+{
+  Serial.println();
+  if(digitalRead(RDSInterruptPin)==LOW)
+  Serial.println("RDS available!");
+  
+  if(strlen(PS)>=8)
+  {
+    Serial.print("PS: ");
+    Serial.println(PS);
+    for(int  Clear=0; Clear<8; Clear++)
+    PS[Clear]=0;
+  }
+  else
+  Serial.println("--No ProgrammServiceMessage success--");
+    
+  Serial.print("PTY: ");
+  Serial.println(PTY);
+  
+  PI_=((PICODE[1]&0xFF)+((PICODE[0]&0xFF)<<8));
+  if(PI_)
+  {
+    Serial.print("PI: ");
+    //Serial.print(PICODE[0]&0xFF,HEX);Serial.println(PICODE[1]&0xFF,HEX);
+    Serial.println(PI_,HEX);
+  }
+  else
+  {
+    Serial.println("--No PI-Code success--");
+  }
+  
+  switch(TC_)
+  {
+    case VOID:
+    {
+      Serial.print("No Traffic Control is present");
+    }break;
+    
+    case EON:
+    {
+      Serial.print("Channel support EON!");
+    }break;
+
+    case TP:
+    {
+      Serial.print("Traffic Pilot is available TP");
+    }break;
+
+    case TA:
+    {
+      Serial.print("Current traffic announcement TA");
+    }break;
+  }
+ 
+  Serial.println();
+}
+void SI4703_readRDS (void)
+{
+    int RDSReady=false;
+    RDSReady=radio.getRDS();
+    if(RDSReady==true)
+    {
+      TC_=radio.getTC();      
+      radio.getPS(PS);
+      radio.getRT(RT);
+      radio.getPTY(PTY);
+      radio.getPI(PICODE);
+      //radio.getTimeDate(CLOCK,DATE);
+      radio.getAF(AF);
+          
+    }
+}
+
+void SI4703_clearRDS (void)
+{ 
+  radio.clearRDS(PS, RT, PTY, PICODE, AF);
+}
+
+void SetDataToEEP (void)
+{  EEPROM.write(ChannelEEP,channel-875);
+  EEPROM.write(VolumeEEP,volume);
+
+}
+
+void GetDataFromEEP (void)
+{
+  channel=EEPROM.read(ChannelEEP)+875;
+  volume=EEPROM.read(VolumeEEP);
+}
+
+
+void OledDisplayInfo()
+ {
+   u8g.firstPage();
+  do
+  {
+    draw();
+  }
+  while ( u8g.nextPage() );
+   //delay(10);
+ }
